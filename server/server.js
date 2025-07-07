@@ -1,132 +1,181 @@
-// server.js - Main server file for Socket.io chat application
-
+require('dotenv').config();
 const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
 const cors = require('cors');
-const dotenv = require('dotenv');
-const path = require('path');
+const { Server } = require('socket.io');
+const { createServer } = require('http');
 
-// Load environment variables
-dotenv.config();
-
-// Initialize Express app
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
+
+// Enhanced CORS configuration
+app.use(cors({
+  origin: process.env.CLIENT_URL || 'http://localhost:3000',
+  credentials: true
+}));
+
+const httpServer = createServer(app);
+const PORT = process.env.PORT || 5000;
+
+const io = new Server(httpServer, {
   cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
+    origin: process.env.CLIENT_URL || 'http://localhost:3000',
     methods: ['GET', 'POST'],
     credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization']
   },
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
+    skipMiddlewares: true,
+  }
 });
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-// Store connected users and messages
 const users = {};
-const messages = [];
-const typingUsers = {};
+const messageHistory = [];
+const MESSAGE_LIMIT = 100;
 
-// Socket.io connection handler
+// Middleware to verify origin
+io.use((socket, next) => {
+  const origin = socket.handshake.headers.origin;
+  const allowedOrigin = process.env.CLIENT_URL || 'http://localhost:3000';
+  
+  if (origin === allowedOrigin) {
+    return next();
+  }
+  return next(new Error('Origin not allowed'));
+});
+
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
 
-  // Handle user joining
-  socket.on('user_join', (username) => {
-    users[socket.id] = { username, id: socket.id };
-    io.emit('user_list', Object.values(users));
-    io.emit('user_joined', { username, id: socket.id });
-    console.log(`${username} joined the chat`);
-  });
+  socket.on('register', (username, callback) => {
+    if (!username || username.trim() === '') {
+      return callback({ error: 'Username cannot be empty' });
+    }
 
-  // Handle chat messages
-  socket.on('send_message', (messageData) => {
-    const message = {
-      ...messageData,
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      timestamp: new Date().toISOString(),
+    if (Object.values(users).some(user => user.username === username)) {
+      return callback({ error: 'Username is already taken' });
+    }
+
+    users[socket.id] = { 
+      username, 
+      online: true, 
+      id: socket.id,
+      joinedAt: new Date().toISOString()
     };
-    
-    messages.push(message);
-    
-    // Limit stored messages to prevent memory issues
-    if (messages.length > 100) {
-      messages.shift();
-    }
-    
-    io.emit('receive_message', message);
+
+    io.emit('userList', Object.values(users));
+    callback({ success: true, username });
+
+    socket.broadcast.emit('notification', {
+      type: 'userJoined',
+      username,
+      timestamp: new Date().toISOString(),
+    });
   });
 
-  // Handle typing indicator
-  socket.on('typing', (isTyping) => {
-    if (users[socket.id]) {
-      const username = users[socket.id].username;
-      
-      if (isTyping) {
-        typingUsers[socket.id] = username;
-      } else {
-        delete typingUsers[socket.id];
-      }
-      
-      io.emit('typing_users', Object.values(typingUsers));
-    }
-  });
+  socket.on('message', (data, callback) => {
+    const user = users[socket.id];
+    if (!user) return callback({ error: 'Not authenticated' });
 
-  // Handle private messages
-  socket.on('private_message', ({ to, message }) => {
     const messageData = {
       id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
+      sender: user.username,
       senderId: socket.id,
-      message,
+      text: data.text,
       timestamp: new Date().toISOString(),
-      isPrivate: true,
     };
-    
-    socket.to(to).emit('private_message', messageData);
-    socket.emit('private_message', messageData);
+
+    messageHistory.push(messageData);
+    if (messageHistory.length > MESSAGE_LIMIT) {
+      messageHistory.shift();
+    }
+
+    io.emit('message', messageData);
+    callback({ success: true });
+
+    io.emit('notification', {
+      type: 'newMessage',
+      sender: user.username,
+      timestamp: new Date().toISOString(),
+    });
   });
 
-  // Handle disconnection
+  socket.on('privateMessage', (data, callback) => {
+    const sender = users[socket.id];
+    if (!sender) return callback({ error: 'Not authenticated' });
+
+    const receiver = Object.values(users).find(
+      user => user.username === data.receiverId
+    );
+
+    if (!receiver) {
+      return callback({ error: 'User not found or offline' });
+    }
+
+    const messageData = {
+      id: Date.now(),
+      sender: sender.username,
+      senderId: socket.id,
+      receiver: data.receiverId,
+      receiverId: receiver.id,
+      text: data.text,
+      timestamp: new Date().toISOString(),
+      private: true,
+    };
+
+    io.to(receiver.id).emit('privateMessage', messageData);
+    socket.emit('privateMessage', messageData);
+    callback({ success: true });
+
+    io.to(receiver.id).emit('notification', {
+      type: 'newPrivateMessage',
+      sender: sender.username,
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  socket.on('typing', (data) => {
+    const user = users[socket.id];
+    if (!user) return;
+
+    if (data.isPrivate && data.receiverId) {
+      const receiver = Object.values(users).find(
+        u => u.username === data.receiverId
+      );
+      if (receiver) {
+        io.to(receiver.id).emit('typing', {
+          username: user.username,
+          isTyping: data.isTyping,
+          isPrivate: true,
+        });
+      }
+    } else {
+      socket.broadcast.emit('typing', {
+        username: user.username,
+        isTyping: data.isTyping,
+        isPrivate: false,
+      });
+    }
+  });
+
+  socket.on('getHistory', (callback) => {
+    callback(messageHistory);
+  });
+
   socket.on('disconnect', () => {
     if (users[socket.id]) {
       const { username } = users[socket.id];
-      io.emit('user_left', { username, id: socket.id });
-      console.log(`${username} left the chat`);
+      delete users[socket.id];
+      io.emit('userList', Object.values(users));
+      io.emit('notification', {
+        type: 'userLeft',
+        username,
+        timestamp: new Date().toISOString(),
+      });
     }
-    
-    delete users[socket.id];
-    delete typingUsers[socket.id];
-    
-    io.emit('user_list', Object.values(users));
-    io.emit('typing_users', Object.values(typingUsers));
+    console.log(`User disconnected: ${socket.id}`);
   });
 });
 
-// API routes
-app.get('/api/messages', (req, res) => {
-  res.json(messages);
-});
-
-app.get('/api/users', (req, res) => {
-  res.json(Object.values(users));
-});
-
-// Root route
-app.get('/', (req, res) => {
-  res.send('Socket.io Chat Server is running');
-});
-
-// Start server
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
+httpServer.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
-module.exports = { app, server, io }; 
